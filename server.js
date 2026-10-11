@@ -61,6 +61,13 @@ async function deliver(p, out) { // live if online, otherwise queued in MongoDB
   return false;
 }
 
+const gcalls = new Map(); // group call state: gid -> { video, parts:Set }
+function gLeave(phone, gid) {
+  const c = gcalls.get(gid); if (!c || !c.parts.delete(phone)) return;
+  c.parts.forEach(p => toPhone(p, { t: 'gcall', k: 'left', gid, phone }));
+  if (!c.parts.size) { gcalls.delete(gid); Groups.findOne({ _id: gid }).then(g => g && g.members.forEach(p => toPhone(p, { t: 'gcall', k: 'ended', gid }))).catch(() => {}); }
+}
+
 wss.on('connection', (ws, req) => {
   let phone;
   try { phone = jwt.verify(new URL(req.url, 'http://x').searchParams.get('token'), JWT_SECRET).phone; }
@@ -77,7 +84,7 @@ wss.on('connection', (ws, req) => {
     const q = await Queue.find({ to: phone }).sort({ createdAt: 1 }).toArray();
     if (q.length) {
       await Queue.deleteMany({ _id: { $in: q.map(d => d._id) } });
-      for (const d of q) { const { _id, to, createdAt, ...msg } = d; send(ws, msg); if (!msg.gid) toPhone(msg.from, { t: 'st', id: msg.id, by: phone, st: 'delivered' }); }
+      for (const d of q) { const { _id, to, createdAt, ...msg } = d; send(ws, msg); toPhone(msg.from, { t: 'st', id: msg.id, by: phone, st: 'delivered', gid: msg.gid }); }
     }
   })().catch(console.error);
 
@@ -97,7 +104,7 @@ wss.on('connection', (ws, req) => {
       const ls = Object.fromEntries((await Users.find({ _id: { $in: ps } }, { projection: { lastSeen: 1 } }).toArray()).map(d => [d._id, d.lastSeen]));
       ps.forEach(p => send(ws, { t: 'presence', phone: p, on: online(p), seen: seen.get(p) || ls[p] || null }));
     } else if (m.t === 'typing' && phoneOk(m.to)) toPhone(m.to, { t: 'typing', from: phone });
-    else if (m.t === 'read' && phoneOk(m.to) && Array.isArray(m.ids)) m.ids.slice(0, 200).forEach(id => toPhone(m.to, { t: 'st', id, by: phone, st: 'read' }));
+    else if (m.t === 'read' && phoneOk(m.to) && Array.isArray(m.ids)) m.ids.slice(0, 200).forEach(id => toPhone(m.to, { t: 'st', id, by: phone, st: 'read', gid: typeof m.gid === 'string' ? m.gid.slice(0, 20) : undefined }));
     else if (m.t === 'msg' && phoneOk(m.to) && encOk(m) && await Users.countDocuments({ _id: m.to })) {
       const out = { t: 'msg', id: String(m.id).slice(0, 40), from: phone, name: ws.name, iv: m.iv, ct: m.ct, ts: Date.now() };
       if (await deliver(m.to, out)) send(ws, { t: 'st', id: out.id, by: m.to, st: 'delivered' });
@@ -111,7 +118,42 @@ wss.on('connection', (ws, req) => {
     } else if (m.t === 'gmsg' && m.copies && typeof m.copies === 'object') {
       const g = await Groups.findOne({ _id: String(m.gid), members: phone }); if (!g) return;
       for (const [p, c] of Object.entries(m.copies)) if (p !== phone && g.members.includes(p) && encOk(c))
-        await deliver(p, { t: 'msg', id: String(m.id).slice(0, 40), from: phone, name: ws.name, gid: g._id, iv: c.iv, ct: c.ct, ts: Date.now() });
+        if (await deliver(p, { t: 'msg', id: String(m.id).slice(0, 40), from: phone, name: ws.name, gid: g._id, iv: c.iv, ct: c.ct, ts: Date.now() }))
+          send(ws, { t: 'st', id: String(m.id).slice(0, 40), by: p, st: 'delivered', gid: g._id });
+    } else if (m.t === 'gedit') { // owner renames group / adds / removes members
+      const g = await Groups.findOne({ _id: String(m.gid), owner: phone }); if (!g) return;
+      const name = typeof m.name === 'string' && m.name.trim() ? m.name.trim().slice(0, 40) : g.name;
+      const rm = new Set((Array.isArray(m.remove) ? m.remove : []).filter(p => p !== phone));
+      const add = (await Users.find({ _id: { $in: (Array.isArray(m.add) ? m.add : []).filter(phoneOk) } }, { projection: { _id: 1 } }).toArray()).map(d => d._id);
+      const mem = [...new Set([...g.members.filter(p => !rm.has(p)), ...add])].slice(0, 15);
+      await Groups.updateOne({ _id: g._id }, { $set: { name, members: mem } });
+      const g2 = { ...g, name, members: mem };
+      mem.forEach(p => toPhone(p, { t: 'group', g: gOut(g2) }));
+      g.members.filter(p => !mem.includes(p)).forEach(p => toPhone(p, { t: 'gremoved', id: g._id }));
+    } else if (m.t === 'gleave') {
+      const g = await Groups.findOne({ _id: String(m.gid), members: phone }); if (!g) return;
+      const mem = g.members.filter(p => p !== phone);
+      if (mem.length < 2) { await Groups.deleteOne({ _id: g._id }); g.members.forEach(p => toPhone(p, { t: 'gremoved', id: g._id })); return; }
+      const owner = g.owner === phone ? mem[0] : g.owner;
+      await Groups.updateOne({ _id: g._id }, { $set: { members: mem, owner } });
+      const g2 = { ...g, members: mem, owner };
+      mem.forEach(p => toPhone(p, { t: 'group', g: gOut(g2) })); toPhone(phone, { t: 'gremoved', id: g._id });
+    } else if (m.t === 'gstart' || m.t === 'gjoin') { // group calls
+      const gid = String(m.gid), g = await Groups.findOne({ _id: gid, members: phone }); if (!g) return;
+      let c = gcalls.get(gid);
+      if (m.t === 'gstart' && !c) {
+        c = { video: !!m.video, parts: new Set([phone]) }; gcalls.set(gid, c);
+        g.members.forEach(p => p !== phone && toPhone(p, { t: 'gcall', k: 'ring', gid, from: phone, video: c.video })); return;
+      }
+      if (!c) return send(ws, { t: 'gcall', k: 'ended', gid });
+      if (c.parts.size >= 6 && !c.parts.has(phone)) return send(ws, { t: 'gcall', k: 'full', gid });
+      const peers = [...c.parts].filter(p => p !== phone); c.parts.add(phone);
+      send(ws, { t: 'gcall', k: 'peers', gid, peers, video: c.video });
+      peers.forEach(p => toPhone(p, { t: 'gcall', k: 'joined', gid, phone }));
+    } else if (m.t === 'gleavecall') gLeave(phone, String(m.gid));
+    else if (m.t === 'gsig' && phoneOk(m.to) && ['offer', 'answer', 'ice'].includes(m.k)) {
+      const c = gcalls.get(String(m.gid));
+      if (c?.parts.has(phone) && c.parts.has(m.to)) toPhone(m.to, { t: 'gcall', k: 'sig', sk: m.k, gid: String(m.gid), from: phone, d: m.d });
     } else if (m.t === 'call' && phoneOk(m.to) && ['offer', 'answer', 'ice', 'end', 'reject'].includes(m.k)) {
       if (!toPhone(m.to, { t: 'call', from: phone, k: m.k, d: m.d, video: !!m.video }) && m.k === 'offer') send(ws, { t: 'call', from: m.to, k: 'unavail' });
     }
@@ -119,7 +161,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', raw => { chain = chain.then(() => handle(raw)).catch(console.error); });
   ws.on('close', () => {
     socks.get(phone)?.delete(ws);
-    if (!online(phone)) { const t = Date.now(); seen.set(phone, t); Users.updateOne({ _id: phone }, { $set: { lastSeen: t } }).catch(() => {}); presence(phone); }
+    if (!online(phone)) { for (const gid of [...gcalls.keys()]) gLeave(phone, gid); const t = Date.now(); seen.set(phone, t); Users.updateOne({ _id: phone }, { $set: { lastSeen: t } }).catch(() => {}); presence(phone); }
   });
 });
 
