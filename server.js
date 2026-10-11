@@ -9,7 +9,13 @@ import { WebSocketServer } from 'ws';
 import { MongoClient } from 'mongodb';
 
 const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SID, JWT_SECRET, ALLOWED_ORIGIN, MONGODB_URI } = process.env;
-const verify = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).verify.v2.services(TWILIO_VERIFY_SID);
+// ---- TEST MODE: free logins with a fixed code, no SMS sent. Turn OFF before real use. ----
+const TEST_MODE = process.env.TEST_MODE === 'true';
+const TEST_CODE = process.env.TEST_CODE || '';
+const TEST_NUMBERS = (process.env.TEST_NUMBERS || '').split(',').map(x => x.trim()).filter(Boolean);
+if (TEST_MODE && (!/^\d{6}$/.test(TEST_CODE) || !TEST_NUMBERS.length)) { console.error('TEST_MODE needs a 6-digit TEST_CODE and TEST_NUMBERS'); process.exit(1); }
+if (TEST_MODE) console.warn('TEST MODE ON: no SMS is sent. Turn it off before real use.');
+const verify = TEST_MODE ? null : twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).verify.v2.services(TWILIO_VERIFY_SID);
 const phoneOk = p => /^\+[1-9]\d{7,14}$/.test(p || '');
 
 // ---- MongoDB (persistent storage) ----
@@ -24,11 +30,12 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors({ origin: ALLOWED_ORIGIN }));
-const limiter = rateLimit({ windowMs: 10 * 60 * 1000, limit: 5 });
+const limiter = rateLimit({ windowMs: 10 * 60 * 1000, limit: TEST_MODE ? 10 : 5 });
 
 app.post('/send-otp', limiter, async (req, res) => {
   const { phone } = req.body || {};
   if (!phoneOk(phone)) return res.status(400).json({ ok: false, error: 'Invalid phone number' });
+  if (TEST_MODE) return res.json(TEST_NUMBERS.includes(phone) ? { ok: true } : { ok: false, error: 'This number is not on the test list' });
   try { await verify.verifications.create({ to: phone, channel: 'sms' }); res.json({ ok: true }); }
   catch (e) { console.error(e.message); res.status(500).json({ ok: false, error: 'Could not send code' }); }
 });
@@ -36,7 +43,7 @@ app.post('/verify-otp', limiter, async (req, res) => {
   const { phone, code } = req.body || {};
   if (!phoneOk(phone) || !/^\d{4,8}$/.test(code || '')) return res.status(400).json({ ok: false, error: 'Invalid request' });
   try {
-    const r = await verify.verificationChecks.create({ to: phone, code });
+    const r = TEST_MODE ? { status: TEST_NUMBERS.includes(phone) && code === TEST_CODE ? 'approved' : 'denied' } : await verify.verificationChecks.create({ to: phone, code });
     if (r.status !== 'approved') return res.status(401).json({ ok: false, error: 'Wrong or expired code' });
     await Users.updateOne({ _id: phone }, { $setOnInsert: { createdAt: new Date() } }, { upsert: true });
     res.json({ ok: true, token: jwt.sign({ phone }, JWT_SECRET, { expiresIn: '30d' }) });
